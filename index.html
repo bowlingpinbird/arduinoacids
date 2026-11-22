@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>3D Peptide Viewer</title>
+  <style>
+    body { font-family: sans-serif; margin: 25px; max-width: 720px; background: #fff; color: #111; }
+    #info { font-size: 1.05em; font-weight: bold; margin-bottom: 10px; color: #333; }
+    #live-sequence {
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: 2rem;
+      letter-spacing: 0.14em;
+      min-height: 2.6rem;
+      margin: 0.2rem 0 0.6rem;
+      color: #111;
+    }
+    button {
+      font-size: 1rem;
+      padding: 0.45rem 0.9rem;
+      margin: 0 8px 8px 0;
+      cursor: pointer;
+    }
+    button:disabled { cursor: default; opacity: 0.55; }
+    .controls { margin: 0.4rem 0 0.8rem; }
+    label { font-size: 0.95rem; margin-right: 8px; }
+    input[type="number"] { width: 8rem; font-size: 1rem; padding: 0.3rem; }
+    #board-log {
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: 0.85rem;
+      white-space: pre-wrap;
+      background: #f4f6f8;
+      border-radius: 6px;
+      padding: 8px 10px;
+      min-height: 2.5rem;
+      margin-bottom: 12px;
+    }
+    canvas {
+      width: 100%; height: 480px; border: 1px solid #ccc; border-radius: 6px;
+      background: #fafafa; cursor: grab; display: block;
+    }
+    canvas:active { cursor: grabbing; }
+    .hint { font-size: 0.85em; color: #666; margin-top: 8px; }
+  </style>
+</head>
+<body>
+
+  <h2>3D Peptide Predictor &amp; Viewer</h2>
+
+  <div id="live-sequence">—</div>
+  <div id="info">Waiting for Arduino sequence...</div>
+  <div class="controls">
+    <button id="fold" type="button" disabled>Fold</button>
+    <button id="reset" type="button">Reset</button>
+  </div>
+  <div class="controls">
+    <label>Known ohms <input id="cal-ohms" type="number" min="1" step="any" value="10000"></label>
+    <button type="button" data-range="0">Calibrate range 0</button>
+    <button type="button" data-range="1">Calibrate range 1</button>
+    <button type="button" data-range="2">Calibrate range 2</button>
+    <button id="calopen" type="button">Calibrate open circuit</button>
+  </div>
+  <div id="board-log"></div>
+  <canvas id="canvas" width="720" height="480"></canvas>
+  <div class="hint">Tip: Click and drag to rotate • Scroll to zoom</div>
+
+  <script>
+    const AA3_TO_1 = {
+      ALA:"A", ARG:"R", ASN:"N", ASP:"D", CYS:"C", GLN:"Q", GLU:"E", GLY:"G",
+      HIS:"H", ILE:"I", LEU:"L", LYS:"K", MET:"M", PHE:"F", PRO:"P", SER:"S",
+      THR:"T", TRP:"W", TYR:"Y", VAL:"V"
+    };
+    const ELEMENT_COLORS = {
+      C: "#4a4e69", N: "#1d4ed8", O: "#dc2626", S: "#d97706", H: "#cbd5e1"
+    };
+
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+
+    let allAtoms = [], bonds = [], caAtoms = [];
+    let rotX = 0.4, rotY = 0.6, zoom = 25.0;
+    let center = { x: 0, y: 0, z: 0 };
+    let dragging = false, lastX = 0, lastY = 0;
+    let lastLoadedPdb = "";
+
+    canvas.addEventListener("mousedown", e => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+    window.addEventListener("mouseup", () => dragging = false);
+    window.addEventListener("mousemove", e => {
+      if (!dragging) return;
+      rotY += (e.clientX - lastX) * 0.01;
+      rotX += (e.clientY - lastY) * 0.01;
+      lastX = e.clientX; lastY = e.clientY;
+      draw();
+    });
+    canvas.addEventListener("wheel", e => {
+      e.preventDefault();
+      zoom = Math.max(5, Math.min(120, zoom * (e.deltaY < 0 ? 1.1 : 0.9)));
+      draw();
+    }, { passive: false });
+
+    function parsePDB(pdbText) {
+      if (!pdbText) return;
+      allAtoms = []; bonds = []; caAtoms = [];
+      let sumX = 0, sumY = 0, sumZ = 0;
+
+      for (const rawLine of pdbText.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line.startsWith("ATOM") && !line.startsWith("HETATM")) continue;
+
+        let atomName, resName, resSeq, x, y, z, elem;
+
+        x = parseFloat(rawLine.substring(30, 38));
+        y = parseFloat(rawLine.substring(38, 46));
+        z = parseFloat(rawLine.substring(46, 54));
+
+        if (!Number.isNaN(x) && !Number.isNaN(y) && !Number.isNaN(z)) {
+          atomName = rawLine.substring(12, 16).trim();
+          resName = rawLine.substring(17, 20).trim();
+          resSeq = parseInt(rawLine.substring(22, 26).trim(), 10) || 1;
+          elem = (rawLine.substring(76, 78).trim() || atomName.replace(/[0-9]/g, "")[0] || "C").toUpperCase();
+        } else {
+          const parts = line.split(/\s+/);
+          const floats = parts.map(p => parseFloat(p)).filter(n => !Number.isNaN(n));
+          if (floats.length < 3) continue;
+          const coordIdx = parts.findIndex((_, idx) =>
+            idx >= 3 &&
+            !Number.isNaN(parseFloat(parts[idx])) &&
+            !Number.isNaN(parseFloat(parts[idx + 1])) &&
+            !Number.isNaN(parseFloat(parts[idx + 2]))
+          );
+          if (coordIdx === -1) continue;
+
+          atomName = parts[2] || "C";
+          resName = parts[3] || "UNK";
+          resSeq = parseInt(parts[coordIdx - 1], 10) || 1;
+          x = parseFloat(parts[coordIdx]);
+          y = parseFloat(parts[coordIdx + 1]);
+          z = parseFloat(parts[coordIdx + 2]);
+          elem = (atomName.replace(/[0-9]/g, "")[0] || "C").toUpperCase();
+        }
+
+        const atom = { atomName, resName, resSeq, x, y, z, elem };
+        allAtoms.push(atom);
+        sumX += x; sumY += y; sumZ += z;
+        if (atomName === "CA") caAtoms.push(atom);
+      }
+
+      if (allAtoms.length > 0) {
+        center = { x: sumX / allAtoms.length, y: sumY / allAtoms.length, z: sumZ / allAtoms.length };
+        let maxDist = 1;
+        for (const a of allAtoms) {
+          const d = Math.hypot(a.x - center.x, a.y - center.y, a.z - center.z);
+          if (d > maxDist) maxDist = d;
+        }
+        zoom = (Math.min(canvas.width, canvas.height) * 0.35) / maxDist;
+      }
+
+      for (let i = 0; i < allAtoms.length; i++) {
+        for (let j = i + 1; j < allAtoms.length; j++) {
+          const a = allAtoms[i], b = allAtoms[j];
+          const dist = Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+          const maxBond = (a.elem === "H" || b.elem === "H") ? 1.25 : 1.75;
+          if (dist > 0.4 && dist <= maxBond) bonds.push([i, j]);
+        }
+      }
+    }
+
+    function project(pt) {
+      const x = pt.x - center.x, y = pt.y - center.y, z = pt.z - center.z;
+      const x1 = x * Math.cos(rotY) - z * Math.sin(rotY);
+      const z1 = z * Math.cos(rotY) + x * Math.sin(rotY);
+      const y2 = y * Math.cos(rotX) - z1 * Math.sin(rotX);
+      const z2 = z1 * Math.cos(rotX) + y * Math.sin(rotX);
+      const perspective = 400 / (400 + z2);
+      return {
+        x: canvas.width / 2 + x1 * zoom * perspective,
+        y: canvas.height / 2 + y2 * zoom * perspective,
+        z: z2,
+        scale: perspective
+      };
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (allAtoms.length === 0) return;
+
+      const projAtoms = allAtoms.map(a => ({ ...a, p: project(a) }));
+
+      ctx.strokeStyle = "#94a3b8";
+      ctx.lineCap = "round";
+      for (const [i, j] of bonds) {
+        const a = projAtoms[i], b = projAtoms[j];
+        ctx.lineWidth = Math.max(2, 4 * ((a.p.scale + b.p.scale) / 2));
+        ctx.beginPath();
+        ctx.moveTo(a.p.x, a.p.y);
+        ctx.lineTo(b.p.x, b.p.y);
+        ctx.stroke();
+      }
+
+      const sorted = [...projAtoms].sort((a, b) => b.p.z - a.p.z);
+      for (const a of sorted) {
+        const baseRadius = a.elem === "H" ? 4.5 : (a.atomName === "CA" ? 9 : 7.5);
+        const r = Math.max(3, baseRadius * a.p.scale);
+        ctx.beginPath();
+        ctx.arc(a.p.x, a.p.y, r, 0, Math.PI * 2);
+        ctx.fillStyle = ELEMENT_COLORS[a.elem] || "#64748b";
+        ctx.fill();
+        ctx.strokeStyle = a.atomName === "CA" ? "#f59e0b" : "#1e293b";
+        ctx.lineWidth = a.atomName === "CA" ? 2.5 : 1;
+        ctx.stroke();
+      }
+
+      ctx.font = "bold 13px sans-serif";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "middle";
+      for (const a of sorted) {
+        if (a.atomName !== "CA") continue;
+        const label = `${a.resSeq}: ${a.resName}`;
+        const lx = a.p.x + 12, ly = a.p.y - 10;
+        const textW = ctx.measureText(label).width;
+        ctx.fillStyle = "rgba(255, 255, 255, 0.88)";
+        ctx.fillRect(lx - 4, ly - 9, textW + 8, 18);
+        ctx.strokeStyle = "#cbd5e1";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(lx - 4, ly - 9, textW + 8, 18);
+        ctx.fillStyle = "#0f172a";
+        ctx.fillText(label, lx, ly);
+      }
+    }
+
+    const seqEl = document.getElementById("live-sequence");
+    const infoEl = document.getElementById("info");
+    const logEl = document.getElementById("board-log");
+    const foldBtn = document.getElementById("fold");
+    const resetBtn = document.getElementById("reset");
+    const calOpenBtn = document.getElementById("calopen");
+    const ohmsInput = document.getElementById("cal-ohms");
+
+    function renderPeptide(pdbText) {
+      parsePDB(pdbText);
+      if (allAtoms.length === 0) {
+        infoEl.style.color = "red";
+        infoEl.textContent = "Generated PDB contains no ATOM records.";
+        return;
+      }
+      draw();
+    }
+
+    function applyState(data) {
+      const letters = (data.sequence || "").split("").join(" ");
+      seqEl.textContent = letters || "—";
+      foldBtn.disabled = !data.sequence || data.status === "folding";
+      const boardOff = !data.connected;
+      resetBtn.disabled = boardOff;
+      calOpenBtn.disabled = boardOff;
+      document.querySelectorAll("button[data-range]").forEach(btn => { btn.disabled = boardOff; });
+      if (data.error) {
+        infoEl.style.color = "red";
+        infoEl.textContent = data.error;
+      } else {
+        infoEl.style.color = "#333";
+        infoEl.textContent = data.message || "";
+      }
+      logEl.textContent = (data.lines || []).join("\n");
+      if (data.pdb && data.pdb !== lastLoadedPdb) {
+        lastLoadedPdb = data.pdb;
+        renderPeptide(data.pdb);
+      }
+    }
+
+    async function sendBoard(body) {
+      const res = await fetch("/board", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      applyState(await res.json());
+    }
+
+    async function loadLatestResult() {
+      try {
+        const res = await fetch("/latest");
+        applyState(await res.json());
+      } catch (err) {
+        console.error("Failed to fetch latest result:", err);
+      }
+    }
+
+    resetBtn.addEventListener("click", () => sendBoard({ action: "reset" }));
+    calOpenBtn.addEventListener("click", () => sendBoard({ action: "calopen" }));
+    document.querySelectorAll("button[data-range]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        sendBoard({ action: "cal", range: Number(btn.dataset.range), ohms: Number(ohmsInput.value) });
+      });
+    });
+
+    foldBtn.addEventListener("click", async () => {
+      foldBtn.disabled = true;
+      infoEl.style.color = "#333";
+      infoEl.textContent = "Stopping the Arduino and folding...";
+      try {
+        const res = await fetch("/fold", { method: "POST" });
+        const data = await res.json();
+        applyState(data);
+      } catch (err) {
+        infoEl.style.color = "red";
+        infoEl.textContent = "Fold request failed.";
+      }
+    });
+
+    setInterval(loadLatestResult, 500);
+    loadLatestResult();
+  </script>
+</body>
+</html>

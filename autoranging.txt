@@ -1,0 +1,125 @@
+How auto-ranging works
+======================
+
+The Arduino never measures resistance directly. It only measures a voltage on pin A0,
+as a number from 0 up to the ADC full scale (16383 on the UNO R4 WiFi at 14 bits).
+That voltage comes from a voltage divider: a known reference resistor on the 5 V side
+and your amino-acid resistor chain on the ground side. The A0 node sits between them.
+
+  active digital pin --[ reference resistor ]-- A0 node --[ series chain ]-- GND
+                                              |
+                                             A0
+
+
+Why one reference resistor is not enough
+----------------------------------------
+A divider only gives a sensitive reading when the chain resistance is comparable to
+the reference. Concretely, the firmware treats a reading as good when the ADC count
+is between about 15% and 85% of that range's open-loop full scale. That corresponds
+to a chain roughly between one-sixth and about six times the reference resistor.
+
+Your chain totals can run from a few kilo-ohms (the first resistor alone) up to a few
+hundred kilo-ohms (a long series chain). That span is much wider than one reference's
+useful window, so the firmware uses three reference resistors and picks the one whose
+window fits the current total.
+
+
+The three ranges
+----------------
+  Range 0: digital pin D5, nominal reference 4.7 kOhm
+           useful for roughly 1 kOhm to 25 kOhm
+
+  Range 1: digital pin D6, nominal reference 33 kOhm
+           useful for roughly 6 kOhm to 180 kOhm
+
+  Range 2: digital pin D7, nominal reference 220 kOhm
+           useful for roughly 40 kOhm to about 1 MOhm
+
+The windows overlap on purpose. When the chain sits near a boundary (for example around
+20 to 40 kOhm), either of two ranges can read it, and the firmware can switch without
+losing coverage.
+
+
+How the firmware switches a range on and off
+--------------------------------------------
+Only one reference is active at a time.
+
+  Active range:   its digital pin is set to OUTPUT and driven HIGH.
+                  That pin sources about 5 V through its reference resistor into the
+                  A0 node, just as if the resistor were wired to the 5 V rail.
+
+  Inactive ranges: their digital pins are set to INPUT (high impedance / "Hi-Z").
+                   Almost no current flows through those branches, so those reference
+                   resistors are effectively disconnected and do not load the node.
+
+Switching ranges is therefore just a software change of which pin is HIGH and which
+pins are INPUT. No relays or extra chips are involved. After each switch the firmware
+waits a few milliseconds and discards a few stale ADC samples so the reading is not
+taken from the previous range's leftover voltage.
+
+
+What "auto-ranging" does on each measurement
+--------------------------------------------
+The function measureChain() starts on whichever range was used last (currentRange),
+because the chain total usually changes only a little between readings.
+
+1. Select that range and take an averaged ADC count (hundreds of samples).
+
+2. Convert the count to a fraction of that range's open-loop full scale:
+      frac = count / FULL_COUNT[range]
+
+3. Decide whether the reading is in the sensitive band:
+      - If frac is above 0.85 and a larger reference exists, step UP one range and
+        re-read.
+      - If frac is below 0.15 and a smaller reference exists, step DOWN one range
+        and re-read.
+      - Otherwise stay on this range.
+
+4. Once the fraction is in band (or the firmware has run out of ranges to try):
+      - If frac is above 0.93 on the largest range, treat the loop as OPEN (topper off).
+      - Otherwise convert the count to ohms and return that as the chain total.
+      - Also reject any converted value above 600 kOhm as open, since a real chain
+        never gets that large.
+
+The conversion from count to ohms uses the calibrated reference for that range and
+that range's open-loop full-scale count:
+
+  R_chain = REF_OHMS[range] * count / (FULL_COUNT[range] - count)
+
+
+Why the open-loop full scale matters
+------------------------------------
+A digital pin driven HIGH is not exactly the supply voltage, and there is a little
+leakage at the A0 node. With the topper off, the count therefore lands a bit below
+the ideal ADC maximum (for example around 15900 instead of 16383 on range 0). The
+calopen command records each range's actual open-loop count and uses it as FULL_COUNT
+for that range. That makes the conversion formula match the real hardware instead of
+assuming a perfect 5 V source and a perfect open circuit.
+
+
+How calibration fits into auto-ranging
+--------------------------------------
+Calibration does not change which range is chosen. It only sets the numbers used once
+a range has been chosen.
+
+  calopen          (topper off)   records FULL_COUNT for every range
+  cal <n> <ohms>   (topper on)    solves for REF_OHMS[n] using a known resistor
+
+After that, any reading on range n uses those two saved values. Auto-ranging still
+picks the range by looking at the fraction of FULL_COUNT; calibration only makes the
+ohms result accurate.
+
+
+What you see in practice
+------------------------
+When you type "raw", the firmware reads all three ranges without auto-ranging and
+prints each count, its percentage of that range's open count, and the implied ohms.
+That is how you can check that the ranges agree on the same physical chain.
+
+When the sequencer is running normally, measureChain() auto-ranges so that the
+reading used for step detection almost always comes from a range whose count sits
+between 15% and 85% of full scale. The letter that gets printed is then based on the
+difference between that ohms reading and the last accepted closed-loop total.
+
+The range used for a given addition is printed in the "Added" and "Unrecognized"
+lines (for example "range 1"), so you can see which reference the firmware settled on.
