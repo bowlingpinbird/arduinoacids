@@ -109,5 +109,4 @@ Calibration is saved to the Arduino's EEPROM, so you only need to do it once. Us
 - Bringing arduinoacids into biochemistry classrooms
 
 ## Team
-
-Built by a team of hallmates.
+Rachel Hu, Ellen Schmidt, Sarah Fu
