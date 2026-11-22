@@ -93,9 +93,11 @@ const int           STABLE_MIN_READS = 4;      // ...and for at least this many 
 const float         STEP_MIN         = 1000.0; // ohms: minimum jump counted as a new resistor
 const int           OPEN_CONFIRM_N   = 5;      // consecutive open reads before "loop open"
 
-// Amino-acid match guard (ohms): reject if the nearest match is farther than this
-const float MATCH_ABS   = 1200.0;
-const float MATCH_FRAC  = 0.08;
+// Amino-acid match guard (ohms): reject if the nearest match is farther than this.
+// Neighbors are about 10 kohm apart, so the halfway boundary is about 5 kohm.
+// 4 kohm plus 2% accepts a reading a few kohm off, such as 15.0 kohm for E (11.9).
+const float MATCH_ABS   = 4000.0;
+const float MATCH_FRAC  = 0.02;
 
 // Serial command words. Change freely; comparison is trimmed + case-insensitive.
 const char* FINISH_COMMAND = "fold";
